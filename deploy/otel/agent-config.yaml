@@ -1,0 +1,138 @@
+# OpenTelemetry Collector Contrib node agent. Mount this ConfigMap at
+# /etc/otelcol-contrib/config.yaml in the agent DaemonSet.
+extensions:
+  runtime_discovery:
+    interval: 60s
+    host_root: /hostfs
+    status_file: /var/lib/otelcol/runtime-capabilities.json
+  # Event-driven discovery of running Docker containers. It supplies endpoint
+  # add/remove events to receiver_creator/prometheus.
+  docker_observer:
+    endpoint: unix:///hostfs/var/run/docker.sock
+    use_host_bindings: true
+    cache_sync_interval: 5m
+  # Limits Kubernetes discovery to workloads scheduled on this node.
+  k8s_observer:
+    auth_type: serviceAccount
+    node: ${env:K8S_NODE_NAME}
+    observe_pods: true
+  health_check:
+    endpoint: ${env:MY_POD_IP}:13133
+  file_storage/queue:
+    directory: /var/lib/otelcol/storage
+
+receivers:
+  hostmetrics:
+    root_path: /hostfs
+    collection_interval: 15s
+    scrapers:
+      cpu: {}
+      disk: {}
+      filesystem: {}
+      load: {}
+      memory: {}
+      network: {}
+      paging: {}
+      processes: {}
+  # Collects Docker containers when the host Docker socket is present.
+  docker_stats:
+    endpoint: unix:///hostfs/var/run/docker.sock
+    collection_interval: 15s
+    timeout: 10s
+  # Collects node, pod, container and volume metrics from the local kubelet.
+  kubeletstats:
+    auth_type: serviceAccount
+    endpoint: "https://${env:K8S_NODE_NAME}:10250"
+    collection_interval: 15s
+    metric_groups: [node, pod, container, volume]
+    extra_metadata_labels: [container.id]
+    collect_all_network_interfaces:
+      node: true
+      pod: true
+  # These receivers own dynamically created child receivers. A child is started
+  # when an observer reports a matching endpoint and stopped when it is removed.
+  receiver_creator/prometheus:
+    watch_observers: [docker_observer, k8s_observer]
+    receivers:
+      docker_prometheus:
+        rule: type == "container" && port > 0 && labels["observability.opentelemetry.io/scrape"] == "true"
+        config:
+          config:
+            scrape_configs:
+              - job_name: "docker-`name`"
+                metrics_path: /metrics
+                static_configs:
+                  - targets: ["`endpoint`"]
+      kubernetes_prometheus:
+        rule: type == "port" && pod.annotations["observability.opentelemetry.io/scrape"] == "true"
+        config:
+          config:
+            scrape_configs:
+              - job_name: "k8s-`pod.namespace`-`pod.name`-`name`"
+                metrics_path: /metrics
+                static_configs:
+                  - targets: ["`endpoint`"]
+  # Enables one filelog child receiver only for explicitly annotated Pod
+  # containers; it is automatically stopped when that container disappears.
+  receiver_creator/logs:
+    watch_observers: [k8s_observer]
+    discovery:
+      enabled: true
+      default_annotations:
+        io.opentelemetry.discovery.logs/enabled: "false"
+    receivers: {}
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 192
+    spike_limit_mib: 64
+  resourcedetection/system:
+    detectors: [system]
+    system:
+      hostname_sources: [os]
+  resource/tenant:
+    attributes:
+      - {key: account.id, action: upsert, value: "${env:ACCOUNT_ID}"}
+      - {key: site.id, action: upsert, value: "${env:SITE_ID}"}
+      - {key: agent.id, action: upsert, value: "${env:AGENT_ID}"}
+      - {key: k8s.cluster.name, action: upsert, value: "${env:K8S_CLUSTER_NAME}"}
+  k8sattributes:
+    auth_type: serviceAccount
+    passthrough: false
+    extract:
+      metadata: [k8s.namespace.name, k8s.pod.name, k8s.pod.uid, k8s.node.name, k8s.container.name]
+  batch:
+    timeout: 5s
+    send_batch_size: 500
+
+exporters:
+  otlp/gateway:
+    endpoint: "${env:OTEL_GATEWAY_ENDPOINT}"
+    tls:
+      ca_file: /etc/otel/tls/ca.crt
+      cert_file: /etc/otel/tls/tls.crt
+      key_file: /etc/otel/tls/tls.key
+      reload_interval: 5m
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      queue_size: 10000
+      storage: file_storage/queue
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 0s
+
+service:
+  extensions: [runtime_discovery, docker_observer, k8s_observer, health_check, file_storage/queue]
+  pipelines:
+    metrics:
+      receivers: [hostmetrics, docker_stats, kubeletstats, receiver_creator/prometheus]
+      processors: [memory_limiter, resourcedetection/system, resource/tenant, k8sattributes, batch]
+      exporters: [otlp/gateway]
+    logs:
+      receivers: [receiver_creator/logs]
+      processors: [memory_limiter, resource/tenant, k8sattributes, batch]
+      exporters: [otlp/gateway]
